@@ -7,6 +7,7 @@ namespace WatchPartyServer.Services;
 
 public class StateBroadcastService : BackgroundService
 {
+    private const string AdminGroup = "Admins";
     private static readonly TimeSpan BroadcastInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan FullStateBroadcastInterval = TimeSpan.FromSeconds(10);
 
@@ -70,18 +71,35 @@ public class StateBroadcastService : BackgroundService
                 _lastBroadcastState.TryRemove(roomId, out _);
         }
 
-        var tasks = rooms
-            .Select(room => BroadcastRoomStateAsync(room.RoomId, cancellationToken))
-            .ToArray();
+        var adminPlaybackStates = new List<object>();
 
-        await Task.WhenAll(tasks);
+        foreach (var room in rooms)
+        {
+            var state = _stateManager.GetRoomSnapshot(room.RoomId);
+            if (state == null) continue;
+
+            await BroadcastRoomStateAsync(room.RoomId, state, cancellationToken);
+
+            adminPlaybackStates.Add(new
+            {
+                RoomId = room.RoomId,
+                RoomName = state.RoomName,
+                CurrentVideoId = state.CurrentVideoId,
+                Timestamp = state.CurrentTime,
+                IsPlaying = state.IsPlaying,
+                SequenceNumber = state.SequenceNumber
+            });
+        }
+
+        if (adminPlaybackStates.Count > 0)
+        {
+            await _hubContext.Clients.Group(AdminGroup)
+                .SendAsync("AdminReceiveAllPlaybackStates", adminPlaybackStates, cancellationToken);
+        }
     }
 
-    private async Task BroadcastRoomStateAsync(string roomId, CancellationToken cancellationToken)
+    private async Task BroadcastRoomStateAsync(string roomId, StateSnapshot state, CancellationToken cancellationToken)
     {
-        var state = _stateManager.GetRoomSnapshot(roomId);
-        if (state == null) return;
-
         var now = DateTime.UtcNow;
         var lastState = _lastBroadcastState.GetOrAdd(roomId, _ => new BroadcastState());
 

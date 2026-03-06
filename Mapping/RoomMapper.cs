@@ -1,6 +1,6 @@
 using WatchPartyServer.Models;
 
-namespace WatchPartyServer.Services;
+namespace WatchPartyServer.Mapping;
 
 internal static class RoomMapper
 {

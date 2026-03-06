@@ -1,23 +1,5 @@
 namespace WatchPartyServer.Models;
 
-public record ServerStats
-{
-    public int TotalRooms { get; init; }
-    public int TotalConnections { get; init; }
-    public int PublicRooms { get; init; }
-    public int PrivateRooms { get; init; }
-    public DateTime ServerStartTime { get; init; }
-    public TimeSpan Uptime { get; init; }
-}
-
-public record ClientConnectionInfo
-{
-    public string ConnectionId { get; init; } = string.Empty;
-    public string ShortId { get; init; } = string.Empty;
-    public string? Username { get; init; }
-    public string? RoomId { get; init; }
-}
-
 public record DetailedRoomInfo
 {
     public string RoomId { get; init; } = string.Empty;

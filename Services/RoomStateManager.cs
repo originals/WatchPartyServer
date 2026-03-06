@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using WatchPartyServer.Mapping;
 using WatchPartyServer.Models;
 
 namespace WatchPartyServer.Services;
@@ -9,6 +10,7 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
     private readonly ConcurrentDictionary<string, string> _connectionToRoom = new();
     private readonly ConcurrentDictionary<string, HashSet<string>> _roomConnections = new();
     private readonly ConcurrentDictionary<string, string> _connectionToUsername = new();
+    private readonly ConcurrentDictionary<string, DateTime> _allConnections = new();
     private readonly HashSet<string> _globalBlacklist = new();
     private readonly object _blacklistLock = new();
 
@@ -454,6 +456,21 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
 
     #region Admin Operations
 
+    public void TrackConnection(string connectionId)
+    {
+        _allConnections[connectionId] = DateTime.UtcNow;
+    }
+
+    public void UntrackConnection(string connectionId)
+    {
+        _allConnections.TryRemove(connectionId, out _);
+    }
+
+    public int GetLobbyConnectionCount()
+    {
+        return _allConnections.Count - _connectionToRoom.Count;
+    }
+
     public ServerStats GetServerStats(DateTime serverStartTime)
     {
         var publicRooms = 0;
@@ -464,10 +481,15 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
             else publicRooms++;
         }
 
+        var roomConnections = _connectionToRoom.Count;
+        var lobbyConnections = _allConnections.Count - roomConnections;
+
         return new ServerStats
         {
             TotalRooms = _rooms.Count,
-            TotalConnections = _connectionToRoom.Count,
+            TotalConnections = _allConnections.Count,
+            LobbyConnections = lobbyConnections,
+            RoomConnections = roomConnections,
             PublicRooms = publicRooms,
             PrivateRooms = privateRooms,
             ServerStartTime = serverStartTime,
@@ -478,8 +500,9 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
     public List<ClientConnectionInfo> GetAllConnections()
     {
         var result = new List<ClientConnectionInfo>();
-        foreach (var connId in _connectionToRoom.Keys)
+        foreach (var kvp in _allConnections)
         {
+            var connId = kvp.Key;
             _connectionToUsername.TryGetValue(connId, out var username);
             _connectionToRoom.TryGetValue(connId, out var roomId);
             result.Add(new ClientConnectionInfo
@@ -487,7 +510,9 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
                 ConnectionId = connId,
                 ShortId = connId.Length >= 8 ? connId[..8] : connId,
                 Username = username,
-                RoomId = roomId
+                RoomId = roomId,
+                IsInLobby = roomId == null,
+                ConnectedAt = kvp.Value
             });
         }
         return result;
@@ -503,6 +528,27 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
             lock (room)
             {
                 result.Add(RoomMapper.ToDetailedInfo(room, connections?.Count ?? 0));
+            }
+        }
+        return result;
+    }
+
+    public List<RoomMemberStates> GetAllRoomMemberStates()
+    {
+        var result = new List<RoomMemberStates>();
+        foreach (var kvp in _rooms)
+        {
+            var room = kvp.Value;
+            lock (room)
+            {
+                result.Add(new RoomMemberStates
+                {
+                    RoomId = room.RoomId,
+                    RoomName = room.RoomName,
+                    Members = room.Members.ToList(),
+                    MemberStates = new Dictionary<string, MemberState>(room.MemberStates),
+                    MemberTimes = new Dictionary<string, double>(room.MemberTimes)
+                });
             }
         }
         return result;

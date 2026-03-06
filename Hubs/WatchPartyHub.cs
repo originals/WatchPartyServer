@@ -1,6 +1,4 @@
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
-using System.Text;
 using Microsoft.AspNetCore.SignalR;
 using WatchPartyServer.Models;
 using WatchPartyServer.Services;
@@ -8,16 +6,14 @@ using WatchPartyServer.Validation;
 
 namespace WatchPartyServer.Hubs;
 
-public class WatchPartyHub : Hub
+public partial class WatchPartyHub : Hub
 {
     private const string LobbyGroup = "Lobby";
+    private const string AdminGroup = "Admins";
+    private const string ServerVersion = "2.0.0";
+
     private static readonly DateTime ServerStartTime = DateTime.UtcNow;
     private static readonly string? AdminKey = Environment.GetEnvironmentVariable("WATCHPARTY_ADMIN_KEY");
-
-    private static readonly TimeSpan PlaybackUpdateMinInterval = TimeSpan.FromMilliseconds(50);
-    private static readonly TimeSpan PlaybackBroadcastDebounceInterval = TimeSpan.FromMilliseconds(150);
-    private static readonly TimeSpan MemberTimeMinInterval = TimeSpan.FromMilliseconds(200);
-    private static readonly TimeSpan MemberStateMinInterval = TimeSpan.FromMilliseconds(100);
     private static readonly ConcurrentDictionary<string, DateTime> LastPlaybackUpdate = new();
     private static readonly ConcurrentDictionary<string, CancellationTokenSource> PendingPlaybackBroadcasts = new();
     private static readonly ConcurrentDictionary<string, DateTime> LastMemberTimeReport = new();
@@ -25,37 +21,94 @@ public class WatchPartyHub : Hub
     private static readonly ConcurrentDictionary<string, bool> AuthenticatedAdmins = new();
     private static readonly ConcurrentDictionary<string, (int Count, DateTime LastAttempt)> FailedAuthAttempts = new();
 
-    private const int MaxFailedAttempts = 5;
-    private static readonly TimeSpan LockoutDuration = TimeSpan.FromMinutes(15);
-
     private readonly IRoomStateManager _stateManager;
     private readonly IAdminStateManager _adminManager;
+    private readonly ILogService _logService;
     private readonly ILogger<WatchPartyHub> _logger;
 
-    public WatchPartyHub(IRoomStateManager stateManager, IAdminStateManager adminManager, ILogger<WatchPartyHub> logger)
+    public WatchPartyHub(
+        IRoomStateManager stateManager, 
+        IAdminStateManager adminManager, 
+        ILogService logService,
+        ILogger<WatchPartyHub> logger)
     {
         _stateManager = stateManager;
         _adminManager = adminManager;
+        _logService = logService;
         _logger = logger;
     }
 
-    private const string ServerVersion = "2.0.0";
-
     private string ShortConnectionId => Context.ConnectionId[..8];
+
+    private void LogEvent(string level, string message, string? roomId = null)
+    {
+        _logService.Log(level, message, ShortConnectionId, roomId);
+    }
+
+    #region Connection Lifecycle
 
     public override async Task OnConnectedAsync()
     {
         _logger.LogInformation("[CONNECT] {ConnectionId}", ShortConnectionId);
+        LogEvent("INFO", "Connected");
+        _adminManager.TrackConnection(Context.ConnectionId);
         await Groups.AddToGroupAsync(Context.ConnectionId, LobbyGroup);
         await base.OnConnectedAsync();
         await BroadcastStatsToAdminsAsync();
+        await BroadcastConnectionsToAdminsAsync();
     }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        _logger.LogInformation("[DISCONNECT] {ConnectionId} {Reason}", 
+            ShortConnectionId, exception?.Message ?? "clean");
+        LogEvent("INFO", $"Disconnected: {exception?.Message ?? "clean"}");
+
+        LastPlaybackUpdate.TryRemove(Context.ConnectionId, out _);
+        LastMemberTimeReport.TryRemove(Context.ConnectionId, out _);
+        LastMemberStateReport.TryRemove(Context.ConnectionId, out _);
+        AuthenticatedAdmins.TryRemove(Context.ConnectionId, out _);
+        FailedAuthAttempts.TryRemove(Context.ConnectionId, out _);
+        _adminManager.UntrackConnection(Context.ConnectionId);
+
+        var result = _stateManager.RemoveConnection(Context.ConnectionId);
+
+        if (result.RoomId != null)
+        {
+            if (result.RoomDeleted)
+            {
+                _logger.LogInformation("[ROOM_AUTO_DELETE] {RoomId} (last member left)", result.RoomId);
+                CancelPendingBroadcast(result.RoomId);
+            }
+            else
+            {
+                if (result.NewHostConnectionId != null)
+                    _logger.LogInformation("[HOST_TRANSFER] Room {RoomId}: new host assigned", result.RoomId);
+
+                await BroadcastRoomStateAsync(result.RoomId);
+            }
+
+            await BroadcastRoomListToLobbyAsync();
+        }
+
+        await BroadcastStatsToAdminsAsync();
+        await BroadcastConnectionsToAdminsAsync();
+        await base.OnDisconnectedAsync(exception);
+    }
+
+    #endregion
+
+    #region Public API
 
     public string GetVersion() => ServerVersion;
 
     public long Ping() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
     public List<RoomInfo> GetRooms() => _stateManager.GetRoomList();
+
+    #endregion
+
+    #region Room Operations
 
     public async Task<RoomInfo> CreateRoom(string roomName, bool isPrivate, string? password, string username, SharedLocation? sharedLocation)
     {
@@ -72,6 +125,7 @@ public class WatchPartyHub : Hub
 
         _logger.LogInformation("[CREATE_ROOM] {Username} created '{RoomName}' ({RoomId}) private={IsPrivate} hasLocation={HasLocation}", 
             username, roomName, room.RoomId, isPrivate, sharedLocation != null);
+        LogEvent("INFO", $"Created room '{roomName}' (private={isPrivate})", room.RoomId);
 
         var state = _stateManager.GetRoomSnapshot(room.RoomId)!;
         await Clients.Caller.SendAsync("ReceiveFullState", state);
@@ -103,6 +157,7 @@ public class WatchPartyHub : Hub
         if (!_stateManager.AddMember(roomId, Context.ConnectionId, username, password))
         {
             _logger.LogWarning("[JOIN_FAILED] {Username} failed to join {RoomId}", username, roomId);
+            LogEvent("WARN", $"Failed to join room", roomId);
             throw new HubException("Failed to join room. Check the room ID and password.");
         }
 
@@ -110,6 +165,7 @@ public class WatchPartyHub : Hub
         await Groups.AddToGroupAsync(Context.ConnectionId, roomId);
 
         _logger.LogInformation("[JOIN_ROOM] {Username} joined {RoomId}", username, roomId);
+        LogEvent("INFO", $"Joined room as '{username}'", roomId);
 
         var state = _stateManager.GetRoomSnapshot(roomId)!;
         await Clients.Caller.SendAsync("ReceiveFullState", state);
@@ -122,6 +178,7 @@ public class WatchPartyHub : Hub
 
     public async Task LeaveRoom(string roomId)
     {
+        LogEvent("INFO", "Left room", roomId);
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, roomId);
         var result = _stateManager.RemoveConnection(Context.ConnectionId);
 
@@ -143,6 +200,7 @@ public class WatchPartyHub : Hub
             throw new HubException("Cannot delete room.");
 
         _logger.LogInformation("[DELETE_ROOM] {RoomId} deleted, {Count} members ejected", roomId, result.ConnectionIds.Count);
+        LogEvent("INFO", $"Deleted room, {result.ConnectionIds.Count} members ejected", roomId);
         CancelPendingBroadcast(roomId);
 
         await Clients.Group(roomId).SendAsync("RoomDeleted");
@@ -172,6 +230,35 @@ public class WatchPartyHub : Hub
         await BroadcastDetailedRoomsToAdminsAsync();
     }
 
+    public async Task BanMember(string roomId, string username)
+    {
+        var result = _stateManager.BanMember(roomId, Context.ConnectionId, username);
+        if (result == null)
+            throw new HubException("Cannot ban member.");
+
+        _logger.LogInformation("[BAN_MEMBER] {Username} banned from {RoomId}", username, roomId);
+
+        if (result.BannedConnectionId != null)
+        {
+            await Clients.Client(result.BannedConnectionId).SendAsync("MemberBanned", username);
+            await Groups.RemoveFromGroupAsync(result.BannedConnectionId, roomId);
+            await Groups.AddToGroupAsync(result.BannedConnectionId, LobbyGroup);
+        }
+
+        await BroadcastRoomStateAsync(roomId);
+        await BroadcastRoomListToLobbyAsync();
+        await BroadcastAllAdminDataAsync();
+    }
+
+    #endregion
+
+    #region Playback Sync
+
+    private static readonly TimeSpan PlaybackUpdateMinInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan PlaybackBroadcastDebounceInterval = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan MemberTimeMinInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan MemberStateMinInterval = TimeSpan.FromMilliseconds(100);
+
     public async Task SetPlayState(string roomId, bool isPlaying)
     {
         if (!_stateManager.IsHost(roomId, Context.ConnectionId))
@@ -188,6 +275,7 @@ public class WatchPartyHub : Hub
         }
 
         await Clients.OthersInGroup(roomId).SendAsync("ReceivePlayStateUpdate", syncPayload);
+        await BroadcastPlaybackStateToAdminsAsync(roomId, syncPayload);
     }
 
     public async Task UpdatePlayback(string roomId, SyncPayload payload)
@@ -218,6 +306,7 @@ public class WatchPartyHub : Hub
         if (playStateChanged)
         {
             await Clients.OthersInGroup(roomId).SendAsync("ReceiveSyncUpdate", syncPayload);
+            await BroadcastPlaybackStateToAdminsAsync(roomId, syncPayload);
         }
         else
         {
@@ -263,6 +352,7 @@ public class WatchPartyHub : Hub
         LastMemberTimeReport[key] = now;
 
         await Clients.Group(roomId).SendAsync("ReceiveMemberTimes", memberTimes);
+        await BroadcastMemberTimesToAdminsAsync(roomId, memberTimes);
     }
 
     public async Task ReportMemberState(string roomId, MemberState state)
@@ -285,6 +375,7 @@ public class WatchPartyHub : Hub
         }
 
         await Clients.Group(roomId).SendAsync("ReceiveMemberStates", result.MemberStates);
+        await BroadcastMemberStatesToAdminsAsync(roomId, result.MemberStates);
     }
 
     public async Task RequestState(string roomId)
@@ -294,6 +385,10 @@ public class WatchPartyHub : Hub
             await Clients.Caller.SendAsync("ReceiveFullState", state);
     }
 
+    #endregion
+
+    #region Queue Operations
+
     public async Task EnqueueVideo(string roomId, QueueItem item)
     {
         if (!_stateManager.IsMember(roomId, Context.ConnectionId)) return;
@@ -302,11 +397,10 @@ public class WatchPartyHub : Hub
 
         var result = _stateManager.EnqueueVideo(roomId, item);
         if (result == null)
-        {
             throw new HubException("Queue limit reached. Wait for a video to be played before adding more.");
-        }
 
         await Clients.Group(roomId).SendAsync("ReceiveQueueUpdate", result.Queue);
+        await BroadcastQueueUpdateToAdminsAsync(roomId, result.Queue);
     }
 
     public async Task UpdateMaxQueuePerUser(string roomId, int maxQueuePerUser)
@@ -346,6 +440,7 @@ public class WatchPartyHub : Hub
         {
             await Clients.Group(roomId).SendAsync("ReceiveQueueUpdate", result.Queue);
         }
+        await BroadcastQueueUpdateToAdminsAsync(roomId, result.Queue);
     }
 
     public async Task RemoveFromQueue(string roomId, int index)
@@ -356,6 +451,7 @@ public class WatchPartyHub : Hub
         if (queue == null) return;
 
         await Clients.Group(roomId).SendAsync("ReceiveQueueUpdate", queue);
+        await BroadcastQueueUpdateToAdminsAsync(roomId, queue);
     }
 
     public async Task ReorderQueue(string roomId, int fromIndex, int toIndex)
@@ -366,62 +462,12 @@ public class WatchPartyHub : Hub
         if (queue == null) return;
 
         await Clients.Group(roomId).SendAsync("ReceiveQueueUpdate", queue);
+        await BroadcastQueueUpdateToAdminsAsync(roomId, queue);
     }
 
-    public async Task BanMember(string roomId, string username)
-    {
-        var result = _stateManager.BanMember(roomId, Context.ConnectionId, username);
-        if (result == null)
-            throw new HubException("Cannot ban member.");
+    #endregion
 
-        _logger.LogInformation("[BAN_MEMBER] {Username} banned from {RoomId}", username, roomId);
-
-        if (result.BannedConnectionId != null)
-        {
-            await Clients.Client(result.BannedConnectionId).SendAsync("MemberBanned", username);
-            await Groups.RemoveFromGroupAsync(result.BannedConnectionId, roomId);
-            await Groups.AddToGroupAsync(result.BannedConnectionId, LobbyGroup);
-        }
-
-        await BroadcastRoomStateAsync(roomId);
-        await BroadcastRoomListToLobbyAsync();
-        await BroadcastAllAdminDataAsync();
-    }
-
-    public override async Task OnDisconnectedAsync(Exception? exception)
-    {
-        _logger.LogInformation("[DISCONNECT] {ConnectionId} {Reason}", 
-            ShortConnectionId, exception?.Message ?? "clean");
-
-        LastPlaybackUpdate.TryRemove(Context.ConnectionId, out _);
-        LastMemberTimeReport.TryRemove(Context.ConnectionId, out _);
-        LastMemberStateReport.TryRemove(Context.ConnectionId, out _);
-        AuthenticatedAdmins.TryRemove(Context.ConnectionId, out _);
-        FailedAuthAttempts.TryRemove(Context.ConnectionId, out _);
-
-        var result = _stateManager.RemoveConnection(Context.ConnectionId);
-
-        if (result.RoomId != null)
-        {
-            if (result.RoomDeleted)
-            {
-                _logger.LogInformation("[ROOM_AUTO_DELETE] {RoomId} (last member left)", result.RoomId);
-                CancelPendingBroadcast(result.RoomId);
-            }
-            else
-            {
-                if (result.NewHostConnectionId != null)
-                    _logger.LogInformation("[HOST_TRANSFER] Room {RoomId}: new host assigned", result.RoomId);
-
-                await BroadcastRoomStateAsync(result.RoomId);
-            }
-
-            await BroadcastRoomListToLobbyAsync();
-        }
-
-        await BroadcastStatsToAdminsAsync();
-        await base.OnDisconnectedAsync(exception);
-    }
+    #region Broadcast Helpers
 
     private static void CancelPendingBroadcast(string roomId)
     {
@@ -445,13 +491,9 @@ public class WatchPartyHub : Hub
             await Clients.Group(roomId).SendAsync("ReceiveFullState", state);
     }
 
-    #region Admin Broadcast Helpers
-
     private async Task BroadcastToAdminsAsync(string method, object data)
     {
-        var adminConnectionIds = AuthenticatedAdmins.Keys.ToList();
-        if (adminConnectionIds.Count == 0) return;
-        await Clients.Clients(adminConnectionIds).SendAsync(method, data);
+        await Clients.Group(AdminGroup).SendAsync(method, data);
     }
 
     private async Task BroadcastStatsToAdminsAsync()
@@ -491,6 +533,48 @@ public class WatchPartyHub : Hub
         await BroadcastToAdminsAsync("AdminReceiveBlacklist", blacklist);
     }
 
+    private async Task BroadcastMemberStatesToAdminsAsync(string roomId, Dictionary<string, MemberState> memberStates)
+    {
+        var snapshot = _stateManager.GetRoomSnapshot(roomId);
+        if (snapshot == null) return;
+        await BroadcastToAdminsAsync("AdminReceiveRoomMemberStates", new { 
+            RoomId = roomId, 
+            Members = snapshot.Members,
+            MemberStates = memberStates 
+        });
+    }
+
+    private async Task BroadcastMemberTimesToAdminsAsync(string roomId, Dictionary<string, double> memberTimes)
+    {
+        var snapshot = _stateManager.GetRoomSnapshot(roomId);
+        if (snapshot == null) return;
+        await BroadcastToAdminsAsync("AdminReceiveRoomMemberTimes", new { 
+            RoomId = roomId, 
+            Members = snapshot.Members,
+            MemberTimes = memberTimes 
+        });
+    }
+
+    private async Task BroadcastQueueUpdateToAdminsAsync(string roomId, List<QueueItem> queue)
+    {
+        await BroadcastToAdminsAsync("AdminReceiveQueueUpdate", new { RoomId = roomId, Queue = queue });
+    }
+
+    private async Task BroadcastPlaybackStateToAdminsAsync(string roomId, SyncPayload syncPayload)
+    {
+        await BroadcastToAdminsAsync("AdminReceivePlaybackState", new { 
+            RoomId = roomId, 
+            Timestamp = syncPayload.Timestamp,
+            IsPlaying = syncPayload.IsPlaying,
+            SequenceNumber = syncPayload.SequenceNumber
+        });
+    }
+
+    private async Task BroadcastLogToAdminsAsync(LogEntry entry)
+    {
+        await BroadcastToAdminsAsync("AdminReceiveLogEntry", entry);
+    }
+
     private async Task BroadcastAllAdminDataAsync()
     {
         await BroadcastStatsToAdminsAsync();
@@ -511,68 +595,34 @@ public class WatchPartyHub : Hub
             throw new HubException("Admin authentication required.");
     }
 
-    private static bool SecureCompare(string a, string b)
-    {
-        if (a == null || b == null) return false;
-        var aBytes = Encoding.UTF8.GetBytes(a);
-        var bBytes = Encoding.UTF8.GetBytes(b);
-        return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
-    }
-
-    private bool IsLockedOut(string connectionId)
-    {
-        if (!FailedAuthAttempts.TryGetValue(connectionId, out var attempt))
-            return false;
-
-        if (attempt.Count >= MaxFailedAttempts && DateTime.UtcNow - attempt.LastAttempt < LockoutDuration)
-            return true;
-
-        if (DateTime.UtcNow - attempt.LastAttempt >= LockoutDuration)
-            FailedAuthAttempts.TryRemove(connectionId, out _);
-
-        return false;
-    }
-
-    private void RecordFailedAttempt(string connectionId)
-    {
-        FailedAuthAttempts.AddOrUpdate(
-            connectionId,
-            _ => (1, DateTime.UtcNow),
-            (_, existing) => (existing.Count + 1, DateTime.UtcNow));
-    }
-
     public async Task<bool> AdminAuthenticate(string adminKey)
     {
         if (string.IsNullOrEmpty(AdminKey))
         {
-            _logger.LogError("[ADMIN_AUTH_DISABLED] Admin key not configured - admin access disabled");
+            _logger.LogError("[ADMIN_AUTH_DISABLED] Admin key not configured");
             throw new HubException("Admin access is not configured on this server.");
         }
 
-        if (IsLockedOut(Context.ConnectionId))
+        if (!string.Equals(adminKey, AdminKey, StringComparison.Ordinal))
         {
-            _logger.LogWarning("[ADMIN_AUTH_LOCKOUT] {ConnectionId} is locked out due to too many failed attempts", ShortConnectionId);
-            throw new HubException("Too many failed attempts. Please try again later.");
-        }
-
-        if (!SecureCompare(adminKey, AdminKey))
-        {
-            RecordFailedAttempt(Context.ConnectionId);
-            var attempts = FailedAuthAttempts.TryGetValue(Context.ConnectionId, out var a) ? a.Count : 1;
-            _logger.LogWarning("[ADMIN_AUTH_FAILED] {ConnectionId} failed auth attempt {Attempt}/{Max}", 
-                ShortConnectionId, attempts, MaxFailedAttempts);
+            _logger.LogWarning("[ADMIN_AUTH_FAILED] {ConnectionId}", ShortConnectionId);
+            LogEvent("WARN", "Admin authentication failed");
             AuthenticatedAdmins.TryRemove(Context.ConnectionId, out _);
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, AdminGroup);
             return false;
         }
 
-        FailedAuthAttempts.TryRemove(Context.ConnectionId, out _);
         AuthenticatedAdmins[Context.ConnectionId] = true;
+        await Groups.AddToGroupAsync(Context.ConnectionId, AdminGroup);
         _logger.LogInformation("[ADMIN_AUTH] {ConnectionId} authenticated as admin", ShortConnectionId);
+        LogEvent("INFO", "Admin authenticated");
 
         await Clients.Caller.SendAsync("AdminReceiveStats", _adminManager.GetServerStats(ServerStartTime));
         await Clients.Caller.SendAsync("AdminReceiveConnections", _adminManager.GetAllConnections());
         await Clients.Caller.SendAsync("AdminReceiveDetailedRooms", _adminManager.GetDetailedRoomList());
         await Clients.Caller.SendAsync("AdminReceiveBlacklist", _adminManager.GetGlobalBlacklist());
+        await Clients.Caller.SendAsync("AdminReceiveMemberStates", _adminManager.GetAllRoomMemberStates());
+        await Clients.Caller.SendAsync("AdminReceiveLogs", _logService.GetLogs(100));
 
         var roomList = _stateManager.GetRoomList();
         var roomStates = new Dictionary<string, StateSnapshot>();
@@ -587,22 +637,42 @@ public class WatchPartyHub : Hub
         return true;
     }
 
-    public ServerStats AdminGetStats()
+    public async Task AdminRequestStats()
     {
         RequireAdmin();
-        return _adminManager.GetServerStats(ServerStartTime);
+        await Clients.Caller.SendAsync("AdminReceiveStats", _adminManager.GetServerStats(ServerStartTime));
     }
 
-    public List<ClientConnectionInfo> AdminGetConnections()
+    public async Task AdminRequestConnections()
     {
         RequireAdmin();
-        return _adminManager.GetAllConnections();
+        await Clients.Caller.SendAsync("AdminReceiveConnections", _adminManager.GetAllConnections());
     }
 
-    public List<DetailedRoomInfo> AdminGetDetailedRooms()
+    public async Task AdminRequestDetailedRooms()
     {
         RequireAdmin();
-        return _adminManager.GetDetailedRoomList();
+        await Clients.Caller.SendAsync("AdminReceiveDetailedRooms", _adminManager.GetDetailedRoomList());
+    }
+
+    public async Task AdminRequestAllMemberStates()
+    {
+        RequireAdmin();
+        await Clients.Caller.SendAsync("AdminReceiveMemberStates", _adminManager.GetAllRoomMemberStates());
+    }
+
+    public async Task AdminRequestLogs(int count = 100, string? levelFilter = null, string? roomIdFilter = null)
+    {
+        RequireAdmin();
+        await Clients.Caller.SendAsync("AdminReceiveLogs", _logService.GetLogs(count, levelFilter, roomIdFilter));
+    }
+
+    public async Task AdminClearLogs()
+    {
+        RequireAdmin();
+        _logService.Clear();
+        LogEvent("INFO", "Admin cleared logs");
+        await Clients.Caller.SendAsync("AdminLogsCleared");
     }
 
     public async Task<bool> AdminForceDeleteRoom(string roomId)
@@ -616,6 +686,7 @@ public class WatchPartyHub : Hub
         }
 
         _logger.LogInformation("[ADMIN_DELETE_ROOM] {RoomId} force deleted, {Count} members ejected", roomId, result.ConnectionIds.Count);
+        LogEvent("WARN", $"Admin force deleted room, {result.ConnectionIds.Count} members ejected", roomId);
 
         await Clients.Group(roomId).SendAsync("RoomDeleted");
 
@@ -641,6 +712,7 @@ public class WatchPartyHub : Hub
 
         var username = _adminManager.GetConnectionUsername(connectionId);
         _logger.LogInformation("[ADMIN_KICK] Kicking connection {ConnectionId} ({Username})", connectionId[..8], username ?? "unknown");
+        LogEvent("WARN", $"Admin kicked user '{username ?? "unknown"}'");
 
         await Clients.Client(connectionId).SendAsync("AdminKicked", "You have been kicked by an administrator.");
 
@@ -657,13 +729,14 @@ public class WatchPartyHub : Hub
     {
         RequireAdmin();
         _logger.LogInformation("[ADMIN_BROADCAST] {Message}", message);
+        LogEvent("INFO", $"Admin broadcast: {message}");
         await Clients.All.SendAsync("AdminMessage", message);
     }
 
-    public List<string> AdminGetBlacklist()
+    public async Task AdminRequestBlacklist()
     {
         RequireAdmin();
-        return _adminManager.GetGlobalBlacklist();
+        await Clients.Caller.SendAsync("AdminReceiveBlacklist", _adminManager.GetGlobalBlacklist());
     }
 
     public async Task<bool> AdminAddToBlacklist(string username)
@@ -674,6 +747,7 @@ public class WatchPartyHub : Hub
 
         var result = _adminManager.AddToGlobalBlacklist(username);
         _logger.LogInformation("[ADMIN_BLACKLIST_ADD] {Username} added={Result}", username, result);
+        LogEvent("WARN", $"Admin added '{username}' to blacklist");
 
         if (result)
             await BroadcastBlacklistToAdminsAsync();
@@ -689,6 +763,7 @@ public class WatchPartyHub : Hub
 
         var result = _adminManager.RemoveFromGlobalBlacklist(username);
         _logger.LogInformation("[ADMIN_BLACKLIST_REMOVE] {Username} removed={Result}", username, result);
+        LogEvent("INFO", $"Admin removed '{username}' from blacklist");
 
         if (result)
             await BroadcastBlacklistToAdminsAsync();
@@ -696,10 +771,11 @@ public class WatchPartyHub : Hub
         return result;
     }
 
-    public StateSnapshot? AdminGetRoomState(string roomId)
+    public async Task AdminRequestRoomState(string roomId)
     {
         RequireAdmin();
-        return _stateManager.GetRoomSnapshot(roomId);
+        var snapshot = _stateManager.GetRoomSnapshot(roomId);
+        await Clients.Caller.SendAsync("AdminReceiveRoomState", roomId, snapshot);
     }
 
     #endregion
