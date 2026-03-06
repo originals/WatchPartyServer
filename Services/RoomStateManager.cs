@@ -15,6 +15,7 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
     public RoomState CreateRoom(string roomName, string hostUsername, string hostConnectionId, bool isPrivate, string? password, SharedLocation? sharedLocation)
     {
         var roomId = Guid.NewGuid().ToString("N")[..8];
+        var hostKey = hostUsername.ToLowerInvariant();
         var room = new RoomState
         {
             RoomId = roomId,
@@ -27,8 +28,8 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
             CreatedAt = DateTime.UtcNow
         };
         room.Members.Add(hostUsername);
-        room.MemberTimes[hostUsername] = 0;
-        room.MemberStates[hostUsername] = MemberState.Idle;
+        room.MemberTimes[hostKey] = 0;
+        room.MemberStates[hostKey] = MemberState.Idle;
 
         _rooms[roomId] = room;
         _connectionToRoom[hostConnectionId] = roomId;
@@ -66,17 +67,12 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
             if (room.IsPrivate && room.Password != (password ?? string.Empty))
                 return false;
 
+            var userKey = username.ToLowerInvariant();
             if (!room.Members.Contains(username))
             {
                 room.Members.Add(username);
-                room.MemberTimes[username] = room.CurrentTime;
-
-                if (room.IsWaitingForReady)
-                    room.MemberStates[username] = MemberState.Loading;
-                else if (!string.IsNullOrEmpty(room.CurrentVideoId))
-                    room.MemberStates[username] = MemberState.Loading;
-                else
-                    room.MemberStates[username] = MemberState.Idle;
+                room.MemberTimes[userKey] = room.CurrentTime;
+                room.MemberStates[userKey] = MemberState.Idle;
             }
         }
 
@@ -159,7 +155,6 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
 
         string? newHost = null;
         bool roomDeleted = false;
-        bool wasWaitingForReady = false;
 
         lock (connections)
         {
@@ -175,8 +170,6 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
             {
                 lock (room)
                 {
-                    wasWaitingForReady = room.IsWaitingForReady;
-
                     if (room.HostConnectionId == connectionId)
                     {
                         newHost = connections.First();
@@ -187,9 +180,10 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
 
                     if (username != null)
                     {
+                        var userKey = username.ToLowerInvariant();
                         room.Members.Remove(username);
-                        room.MemberTimes.Remove(username);
-                        room.MemberStates.Remove(username);
+                        room.MemberTimes.Remove(userKey);
+                        room.MemberStates.Remove(userKey);
                     }
                 }
             }
@@ -199,8 +193,7 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
         {
             RoomId = roomId,
             RoomDeleted = roomDeleted,
-            NewHostConnectionId = newHost,
-            WasWaitingForReady = wasWaitingForReady
+            NewHostConnectionId = newHost
         };
     }
 
@@ -209,79 +202,30 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
         if (!_rooms.TryGetValue(roomId, out var room)) return null;
         if (!_connectionToUsername.TryGetValue(connectionId, out var username)) return null;
 
+        var userKey = username.ToLowerInvariant();
         lock (room)
         {
-            room.MemberTimes[username] = currentTime;
-            if (room.HostConnectionId == connectionId)
-                room.CurrentTime = currentTime;
-
+            room.MemberTimes[userKey] = currentTime;
             return new Dictionary<string, double>(room.MemberTimes);
         }
     }
 
-    public Dictionary<string, MemberState>? UpdateMemberState(string roomId, string connectionId, MemberState state)
+    public MemberStateUpdateResult? UpdateMemberState(string roomId, string connectionId, MemberState state)
     {
         if (!_rooms.TryGetValue(roomId, out var room)) return null;
         if (!_connectionToUsername.TryGetValue(connectionId, out var username)) return null;
 
+        var userKey = username.ToLowerInvariant();
         lock (room)
         {
-            room.MemberStates[username] = state;
-            return new Dictionary<string, MemberState>(room.MemberStates);
-        }
-    }
-
-    public bool AreAllMembersReady(string roomId)
-    {
-        if (!_rooms.TryGetValue(roomId, out var room)) return false;
-
-        lock (room)
-        {
-            if (!room.IsWaitingForReady) return false;
-
-            foreach (var member in room.Members)
+            bool stateChanged = !room.MemberStates.TryGetValue(userKey, out var previousState) || previousState != state;
+            room.MemberStates[userKey] = state;
+            return new MemberStateUpdateResult
             {
-                if (!room.MemberStates.TryGetValue(member, out var state))
-                    return false;
-                if (state != MemberState.Ready)
-                    return false;
-            }
-            return true;
+                MemberStates = new Dictionary<string, MemberState>(room.MemberStates),
+                StateChanged = stateChanged
+            };
         }
-    }
-
-    public void StartWaitingForReady(string roomId, string videoId)
-    {
-        if (!_rooms.TryGetValue(roomId, out var room)) return;
-
-        lock (room)
-        {
-            room.IsWaitingForReady = true;
-            room.PendingVideoId = videoId;
-            room.IsPlaying = false;
-            foreach (var member in room.Members)
-            {
-                room.MemberStates[member] = MemberState.Loading;
-            }
-        }
-    }
-
-    public void FinishWaitingForReady(string roomId)
-    {
-        if (!_rooms.TryGetValue(roomId, out var room)) return;
-
-        lock (room)
-        {
-            room.IsWaitingForReady = false;
-            room.IsPlaying = true;
-            room.CurrentTime = 0;
-        }
-    }
-
-    public bool IsWaitingForReady(string roomId)
-    {
-        if (!_rooms.TryGetValue(roomId, out var room)) return false;
-        return room.IsWaitingForReady;
     }
 
     public DeleteRoomResult? DeleteRoom(string roomId, string connectionId)
@@ -311,13 +255,52 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
         return new DeleteRoomResult { ConnectionIds = connectionIds };
     }
 
-    public void UpdatePlayback(string roomId, SyncPayload payload)
+    public SyncPayload? UpdatePlayback(string roomId, SyncPayload payload)
     {
-        if (!_rooms.TryGetValue(roomId, out var room)) return;
+        if (!_rooms.TryGetValue(roomId, out var room)) return null;
         lock (room)
         {
             room.CurrentTime = payload.Timestamp;
             room.IsPlaying = payload.IsPlaying;
+            room.LastTimeUpdate = DateTime.UtcNow;
+            room.SequenceNumber++;
+            return new SyncPayload
+            {
+                Timestamp = payload.Timestamp,
+                IsPlaying = payload.IsPlaying,
+                SequenceNumber = room.SequenceNumber
+            };
+        }
+    }
+
+    public SyncPayload? SetPlayState(string roomId, bool isPlaying)
+    {
+        if (!_rooms.TryGetValue(roomId, out var room)) return null;
+        lock (room)
+        {
+            room.IsPlaying = isPlaying;
+            room.LastTimeUpdate = DateTime.UtcNow;
+            room.SequenceNumber++;
+            return new SyncPayload
+            {
+                Timestamp = room.CurrentTime,
+                IsPlaying = isPlaying,
+                SequenceNumber = room.SequenceNumber
+            };
+        }
+    }
+
+    public SyncPayload? GetCurrentPlaybackState(string roomId)
+    {
+        if (!_rooms.TryGetValue(roomId, out var room)) return null;
+        lock (room)
+        {
+            return new SyncPayload
+            {
+                Timestamp = room.GetCalculatedTime(),
+                IsPlaying = room.IsPlaying,
+                SequenceNumber = room.SequenceNumber
+            };
         }
     }
 
@@ -337,11 +320,31 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
     public EnqueueResult? EnqueueVideo(string roomId, QueueItem item)
     {
         if (!_rooms.TryGetValue(roomId, out var room)) return null;
+        if (string.IsNullOrWhiteSpace(item.VideoId)) return null;
         lock (room)
         {
+            if (room.MaxQueuePerUser > 0)
+            {
+                int userQueueCount = room.Queue.Count(q => 
+                    string.Equals(q.AddedBy, item.AddedBy, StringComparison.OrdinalIgnoreCase));
+                if (userQueueCount >= room.MaxQueuePerUser)
+                    return null;
+            }
             room.Queue.Add(item);
             return new EnqueueResult { Queue = room.Queue.ToList() };
         }
+    }
+
+    public bool UpdateMaxQueuePerUser(string roomId, string connectionId, int maxQueuePerUser)
+    {
+        if (!_rooms.TryGetValue(roomId, out var room)) return false;
+        if (room.HostConnectionId != connectionId) return false;
+
+        lock (room)
+        {
+            room.MaxQueuePerUser = Math.Max(0, maxQueuePerUser);
+        }
+        return true;
     }
 
     public SkipResult? SkipToNext(string roomId)
@@ -354,15 +357,19 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
 
             var next = room.Queue[0];
             room.Queue.RemoveAt(0);
+
             room.CurrentVideoId = next.VideoId;
             room.CurrentTime = 0;
             room.IsPlaying = true;
+            room.LastTimeUpdate = DateTime.UtcNow;
+            room.SequenceNumber++;
 
             return new SkipResult
             {
                 VideoId = next.VideoId,
                 Queue = room.Queue.ToList(),
-                IsPlaying = true
+                IsPlaying = true,
+                SequenceNumber = room.SequenceNumber
             };
         }
     }
@@ -409,8 +416,8 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
 
             room.BannedUsers.Add(usernameLower);
             room.Members.Remove(username);
-            room.MemberTimes.Remove(username);
-            room.MemberStates.Remove(username);
+            room.MemberTimes.Remove(usernameLower);
+            room.MemberStates.Remove(usernameLower);
         }
 
         foreach (var kvp in _connectionToUsername)

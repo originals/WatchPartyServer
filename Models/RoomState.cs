@@ -13,12 +13,22 @@ public class RoomState
     public string CurrentVideoId { get; set; } = string.Empty;
     public double CurrentTime { get; set; }
     public bool IsPlaying { get; set; }
-    public bool IsWaitingForReady { get; set; }
-    public string PendingVideoId { get; set; } = string.Empty;
+    public DateTime LastTimeUpdate { get; set; } = DateTime.UtcNow;
+    public long SequenceNumber { get; set; }
     public List<QueueItem> Queue { get; set; } = new();
     public List<string> Members { get; set; } = new();
     public HashSet<string> BannedUsers { get; set; } = new();
     public Dictionary<string, double> MemberTimes { get; set; } = new();
     public Dictionary<string, MemberState> MemberStates { get; set; } = new();
     public DateTime CreatedAt { get; set; }
+    public int MaxQueuePerUser { get; set; }
+
+    public double GetCalculatedTime()
+    {
+        if (!IsPlaying || string.IsNullOrEmpty(CurrentVideoId))
+            return CurrentTime;
+
+        var elapsed = (DateTime.UtcNow - LastTimeUpdate).TotalSeconds;
+        return CurrentTime + elapsed;
+    }
 }

@@ -12,9 +12,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Remove="Configuration\**" />
     <Compile Remove="TestClient\**" />
+    <Content Remove="Configuration\**" />
     <Content Remove="TestClient\**" />
+    <EmbeddedResource Remove="Configuration\**" />
     <EmbeddedResource Remove="TestClient\**" />
+    <None Remove="Configuration\**" />
     <None Remove="TestClient\**" />
   </ItemGroup>
 

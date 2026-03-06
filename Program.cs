@@ -17,6 +17,7 @@ builder.Services.AddSignalR()
 builder.Services.AddSingleton<RoomStateManager>();
 builder.Services.AddSingleton<IRoomStateManager>(sp => sp.GetRequiredService<RoomStateManager>());
 builder.Services.AddSingleton<IAdminStateManager>(sp => sp.GetRequiredService<RoomStateManager>());
+builder.Services.AddHostedService<StateBroadcastService>();
 
 builder.Services.AddCors(options =>
 {

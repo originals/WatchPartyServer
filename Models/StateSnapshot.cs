@@ -10,9 +10,10 @@ public record StateSnapshot
     public string CurrentVideoId { get; init; } = string.Empty;
     public double CurrentTime { get; init; }
     public bool IsPlaying { get; init; }
-    public bool IsWaitingForReady { get; init; }
+    public long SequenceNumber { get; init; }
     public List<QueueItem> Queue { get; init; } = new();
     public List<string> Members { get; init; } = new();
     public Dictionary<string, double> MemberTimes { get; init; } = new();
     public Dictionary<string, MemberState> MemberStates { get; init; } = new();
+    public int MaxQueuePerUser { get; init; }
 }

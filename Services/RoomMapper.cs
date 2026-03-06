@@ -29,13 +29,14 @@ internal static class RoomMapper
             HostUsername = room.HostUsername,
             SharedLocation = room.SharedLocation,
             CurrentVideoId = room.CurrentVideoId,
-            CurrentTime = room.CurrentTime,
+            CurrentTime = room.GetCalculatedTime(),
             IsPlaying = room.IsPlaying,
-            IsWaitingForReady = room.IsWaitingForReady,
+            SequenceNumber = room.SequenceNumber,
             Queue = room.Queue.ToList(),
             Members = room.Members.ToList(),
             MemberTimes = new Dictionary<string, double>(room.MemberTimes),
-            MemberStates = new Dictionary<string, MemberState>(room.MemberStates)
+            MemberStates = new Dictionary<string, MemberState>(room.MemberStates),
+            MaxQueuePerUser = room.MaxQueuePerUser
         };
     }
 
