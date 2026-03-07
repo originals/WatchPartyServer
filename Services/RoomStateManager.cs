@@ -11,8 +11,15 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
     private readonly ConcurrentDictionary<string, HashSet<string>> _roomConnections = new();
     private readonly ConcurrentDictionary<string, string> _connectionToUsername = new();
     private readonly ConcurrentDictionary<string, DateTime> _allConnections = new();
-    private readonly HashSet<string> _globalBlacklist = new();
+    private readonly HashSet<string> _globalBlacklist;
     private readonly object _blacklistLock = new();
+    private readonly IBanListPersistenceService _banListPersistence;
+
+    public RoomStateManager(IBanListPersistenceService banListPersistence)
+    {
+        _banListPersistence = banListPersistence;
+        _globalBlacklist = banListPersistence.Load();
+    }
 
     public RoomState CreateRoom(string roomName, string hostUsername, string hostConnectionId, bool isPrivate, string? password, SharedLocation? sharedLocation)
     {
@@ -103,6 +110,16 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
         var result = new List<RoomInfo>();
         foreach (var kvp in _rooms)
         {
+            var roomId = kvp.Key;
+            if (!_roomConnections.TryGetValue(roomId, out var connections))
+                continue;
+
+            lock (connections)
+            {
+                if (connections.Count == 0)
+                    continue;
+            }
+
             var room = kvp.Value;
             lock (room)
             {
@@ -140,6 +157,13 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
     {
         return _connectionToRoom.TryGetValue(connectionId, out var memberRoomId)
                && memberRoomId == roomId;
+    }
+
+    public bool IsConnectionBlacklisted(string connectionId)
+    {
+        if (!_connectionToUsername.TryGetValue(connectionId, out var username))
+            return false;
+        return IsGloballyBlacklisted(username);
     }
 
     public RemoveConnectionResult RemoveConnection(string connectionId)
@@ -523,11 +547,22 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
         var result = new List<DetailedRoomInfo>();
         foreach (var kvp in _rooms)
         {
+            var roomId = kvp.Key;
+            if (!_roomConnections.TryGetValue(roomId, out var connections))
+                continue;
+
+            int connectionCount;
+            lock (connections)
+            {
+                connectionCount = connections.Count;
+                if (connectionCount == 0)
+                    continue;
+            }
+
             var room = kvp.Value;
-            _roomConnections.TryGetValue(kvp.Key, out var connections);
             lock (room)
             {
-                result.Add(RoomMapper.ToDetailedInfo(room, connections?.Count ?? 0));
+                result.Add(RoomMapper.ToDetailedInfo(room, connectionCount));
             }
         }
         return result;
@@ -560,11 +595,6 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
         return CleanupRoomConnections(roomId);
     }
 
-    public bool AdminKickConnection(string connectionId)
-    {
-        return _connectionToRoom.ContainsKey(connectionId);
-    }
-
     public string? GetConnectionUsername(string connectionId)
     {
         return _connectionToUsername.TryGetValue(connectionId, out var username) ? username : null;
@@ -580,18 +610,34 @@ public class RoomStateManager : IRoomStateManager, IAdminStateManager
 
     public bool AddToGlobalBlacklist(string username)
     {
+        bool added;
+        List<string> currentList;
         lock (_blacklistLock)
         {
-            return _globalBlacklist.Add(username.ToLowerInvariant());
+            added = _globalBlacklist.Add(username.ToLowerInvariant());
+            currentList = _globalBlacklist.ToList();
         }
+        if (added)
+        {
+            _ = _banListPersistence.SaveAsync(currentList);
+        }
+        return added;
     }
 
     public bool RemoveFromGlobalBlacklist(string username)
     {
+        bool removed;
+        List<string> currentList;
         lock (_blacklistLock)
         {
-            return _globalBlacklist.Remove(username.ToLowerInvariant());
+            removed = _globalBlacklist.Remove(username.ToLowerInvariant());
+            currentList = _globalBlacklist.ToList();
         }
+        if (removed)
+        {
+            _ = _banListPersistence.SaveAsync(currentList);
+        }
+        return removed;
     }
 
     #endregion

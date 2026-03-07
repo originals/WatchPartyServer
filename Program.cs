@@ -14,6 +14,7 @@ builder.Services.AddSignalR()
         options.PayloadSerializerSettings.ContractResolver = new CamelCasePropertyNamesContractResolver();
     });
 
+builder.Services.AddSingleton<IBanListPersistenceService, BanListPersistenceService>();
 builder.Services.AddSingleton<RoomStateManager>();
 builder.Services.AddSingleton<IRoomStateManager>(sp => sp.GetRequiredService<RoomStateManager>());
 builder.Services.AddSingleton<IAdminStateManager>(sp => sp.GetRequiredService<RoomStateManager>());

@@ -9,7 +9,6 @@ public interface IAdminStateManager
     List<DetailedRoomInfo> GetDetailedRoomList();
     List<RoomMemberStates> GetAllRoomMemberStates();
     DeleteRoomResult? AdminDeleteRoom(string roomId);
-    bool AdminKickConnection(string connectionId);
     string? GetConnectionUsername(string connectionId);
     List<string> GetGlobalBlacklist();
     bool AddToGlobalBlacklist(string username);

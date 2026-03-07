@@ -13,6 +13,7 @@ public interface IRoomStateManager
     SyncPayload? GetCurrentPlaybackState(string roomId);
     bool IsHost(string roomId, string connectionId);
     bool IsMember(string roomId, string connectionId);
+    bool IsConnectionBlacklisted(string connectionId);
     RemoveConnectionResult RemoveConnection(string connectionId);
     Dictionary<string, double>? UpdateMemberTime(string roomId, string connectionId, double currentTime);
     MemberStateUpdateResult? UpdateMemberState(string roomId, string connectionId, MemberState state);

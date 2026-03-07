@@ -40,9 +40,18 @@ public partial class WatchPartyHub : Hub
 
     private string ShortConnectionId => Context.ConnectionId[..8];
 
+    private string ConnectionIdentifier
+    {
+        get
+        {
+            var username = _adminManager.GetConnectionUsername(Context.ConnectionId);
+            return username != null ? $"{ShortConnectionId} ({username})" : ShortConnectionId;
+        }
+    }
+
     private void LogEvent(string level, string message, string? roomId = null)
     {
-        _logService.Log(level, message, ShortConnectionId, roomId);
+        _logService.Log(level, message, ConnectionIdentifier, roomId);
     }
 
     #region Connection Lifecycle
@@ -60,8 +69,11 @@ public partial class WatchPartyHub : Hub
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        _logger.LogInformation("[DISCONNECT] {ConnectionId} {Reason}", 
-            ShortConnectionId, exception?.Message ?? "clean");
+        var username = _adminManager.GetConnectionUsername(Context.ConnectionId);
+        var identifier = username != null ? $"{ShortConnectionId} ({username})" : ShortConnectionId;
+
+        _logger.LogInformation("[DISCONNECT] {Identifier} {Reason}", 
+            identifier, exception?.Message ?? "clean");
         LogEvent("INFO", $"Disconnected: {exception?.Message ?? "clean"}");
 
         LastPlaybackUpdate.TryRemove(Context.ConnectionId, out _);
@@ -104,7 +116,12 @@ public partial class WatchPartyHub : Hub
 
     public long Ping() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    public List<RoomInfo> GetRooms() => _stateManager.GetRoomList();
+    public List<RoomInfo> GetRooms()
+    {
+        if (_stateManager.IsConnectionBlacklisted(Context.ConnectionId))
+            return new List<RoomInfo>();
+        return _stateManager.GetRoomList();
+    }
 
     #endregion
 
@@ -380,6 +397,8 @@ public partial class WatchPartyHub : Hub
 
     public async Task RequestState(string roomId)
     {
+        if (!_stateManager.IsMember(roomId, Context.ConnectionId))
+            return;
         var state = _stateManager.GetRoomSnapshot(roomId);
         if (state != null)
             await Clients.Caller.SendAsync("ReceiveFullState", state);
@@ -701,36 +720,45 @@ public partial class WatchPartyHub : Hub
         return true;
     }
 
-    public async Task<bool> AdminKickUser(string connectionId)
-    {
-        RequireAdmin();
-        if (!_adminManager.AdminKickConnection(connectionId))
-        {
-            _logger.LogWarning("[ADMIN_KICK_FAILED] Connection {ConnectionId} not found", connectionId[..8]);
-            return false;
-        }
-
-        var username = _adminManager.GetConnectionUsername(connectionId);
-        _logger.LogInformation("[ADMIN_KICK] Kicking connection {ConnectionId} ({Username})", connectionId[..8], username ?? "unknown");
-        LogEvent("WARN", $"Admin kicked user '{username ?? "unknown"}'");
-
-        await Clients.Client(connectionId).SendAsync("AdminKicked", "You have been kicked by an administrator.");
-
-        var result = _stateManager.RemoveConnection(connectionId);
-        if (result.RoomId != null && !result.RoomDeleted)
-            await BroadcastRoomStateAsync(result.RoomId);
-
-        await BroadcastRoomListToLobbyAsync();
-        await BroadcastAllAdminDataAsync();
-        return true;
-    }
-
     public async Task AdminBroadcastMessage(string message)
     {
         RequireAdmin();
         _logger.LogInformation("[ADMIN_BROADCAST] {Message}", message);
         LogEvent("INFO", $"Admin broadcast: {message}");
         await Clients.All.SendAsync("AdminMessage", message);
+    }
+
+    public async Task<bool> AdminBanAndKickUser(string username)
+    {
+        RequireAdmin();
+        if (string.IsNullOrWhiteSpace(username))
+            return false;
+
+        var added = _adminManager.AddToGlobalBlacklist(username);
+        _logger.LogInformation("[ADMIN_BAN_KICK] {Username} banned={Result}", username, added);
+        LogEvent("WARN", $"Admin banned and kicked '{username}'");
+
+        var connections = _adminManager.GetAllConnections()
+            .Where(c => string.Equals(c.Username, username, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        foreach (var conn in connections)
+        {
+            await Clients.Client(conn.ConnectionId).SendAsync("AdminKicked", "You have been banned by an administrator.");
+            var result = _stateManager.RemoveConnection(conn.ConnectionId);
+            if (result.RoomId != null)
+            {
+                await Groups.RemoveFromGroupAsync(conn.ConnectionId, result.RoomId);
+                if (!result.RoomDeleted)
+                    await BroadcastRoomStateAsync(result.RoomId);
+            }
+            await Groups.RemoveFromGroupAsync(conn.ConnectionId, LobbyGroup);
+        }
+
+        await BroadcastBlacklistToAdminsAsync();
+        await BroadcastRoomListToLobbyAsync();
+        await BroadcastAllAdminDataAsync();
+        return true;
     }
 
     public async Task AdminRequestBlacklist()
